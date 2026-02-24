@@ -81,8 +81,11 @@ Comm::Comm(LAMMPS *lmp) : Pointers(lmp)
   bufextra_max = bufextra;
 
   grid2proc = nullptr;
+  staggered_grid2proc = nullptr;
+  staggered_proc2grid = nullptr;
   xsplit = ysplit = zsplit = nullptr;
   rcbnew = 0;
+  staggerednew = 0;
   multi_reduce = 0;
 
   // use of OpenMP threads
@@ -112,6 +115,7 @@ Comm::Comm(LAMMPS *lmp) : Pointers(lmp)
   if (me == 0)
     utils::logmesg(lmp,"  using {} OpenMP thread(s) per MPI task\n",nthreads);
 #endif
+  mysplit[0][0] = mysplit[0][1] = mysplit[1][0] = mysplit[1][1] = mysplit[2][0] = mysplit[2][1] = 0;
 
 }
 
@@ -120,6 +124,8 @@ Comm::Comm(LAMMPS *lmp) : Pointers(lmp)
 Comm::~Comm()
 {
   memory->destroy(grid2proc);
+  memory->destroy(staggered_grid2proc);
+  memory->destroy(staggered_proc2grid);
   memory->destroy(xsplit);
   memory->destroy(ysplit);
   memory->destroy(zsplit);
