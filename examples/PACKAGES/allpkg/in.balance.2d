@@ -54,9 +54,7 @@ fix		5 all balance/all every 50 grid staggered global 0.9 0.003
 
 compute		1 all property/atom proc
 variable	p atom c_1%10
-dump		2 all custom 50 /tmp/tmp.dump id v_p x y z
-
-log         balance_all.log
+#dump		2 all custom 50 dump.in.balance.2d id v_p x y z
 
 thermo_style	custom step temp epair press f_5[*]
 thermo		100
