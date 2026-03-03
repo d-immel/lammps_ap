@@ -15,7 +15,6 @@
 
 #include "ALL.hpp"
 
-#include "timer.h"
 #include "pointers.h"
 #include "pair.h"
 #include "fix_store_atom.h"
@@ -111,7 +110,7 @@ FixBalanceAll::FixBalanceAll(LAMMPS *lmp, int narg, char **arg) :
   pre_exchange_migrate = 1;
 
   vector_flag = 1;
-  size_vector = 6;
+  size_vector = 2;
   extvector = 0;
 
   // parse required arguments
@@ -245,14 +244,11 @@ FixBalanceAll::FixBalanceAll(LAMMPS *lmp, int narg, char **arg) :
   y_masters = MPI_COMM_NULL;
   z_masters = MPI_COMM_NULL;
 
-  timer_lb = imbalance = maxloadperproc = -1;
+  imbalance = maxloadperproc = -1;
 
   force_reneighbor = 1;
   lastbalance = -1;
   next_reneighbor = -1;
-
-  reduce_outvec_flag = false;
-  for (int i = 0; i < 3; ++i) outvec_timer[i] = -1;
 }
 
 /**
@@ -419,8 +415,6 @@ void FixBalanceAll::balance()
   if (update->ntimestep == lastbalance) return;
   lastbalance = update->ntimestep;
 
-  double timer_lb_start = platform::walltime();
-
   set_weights();
 
   work = get_work();
@@ -437,9 +431,6 @@ void FixBalanceAll::balance()
     all_last = nullptr;
   }
   unset_weights();
-
-  timer_lb = platform::walltime() - timer_lb_start;
-  reduce_outvec_flag = true;
 }
 
 /**
@@ -501,10 +492,6 @@ void FixBalanceAll::balance_global()
 
   domain->pbc();
   domain->reset_box();
-
-  // processors may not have complex/simple particles yet, but get some during layer-balancing
-  // -> calculate global average
-  // only once since timers are evaluated
 
   // atoms should be inside of the boundaries for the histogram calculation
   irregular->migrate_atoms();
@@ -831,29 +818,8 @@ std::vector<double> FixBalanceAll::calc_histogram(int dimension)
 
 double FixBalanceAll::compute_vector(int i)
 {
-  // TODO: remove communication and lb timing (doing more than required)
-  if (/*remove*/reduce_outvec_flag/*elsewhere*/) {
-    double reducebuffer_s, reducebuffer_r;
-    reducebuffer_s = /*remove!*/timer_lb/*elsewhere*/;
-
-    // calc min
-    MPI_Allreduce(&reducebuffer_s, &reducebuffer_r, 1, MPI_DOUBLE, MPI_MIN, world);
-    outvec_timer[0] = reducebuffer_r;
-
-    // calc avg
-    MPI_Allreduce(&reducebuffer_s, &reducebuffer_r, 1, MPI_DOUBLE, MPI_SUM, world);
-    outvec_timer[1] = reducebuffer_r / comm->nprocs;
-
-    // calc max
-    MPI_Allreduce(&reducebuffer_s, &reducebuffer_r, 1, MPI_DOUBLE, MPI_MAX, world);
-    outvec_timer[2] = reducebuffer_r;
-
-    reduce_outvec_flag = false;
-  }
-
   if (i == 0) return maxloadperproc;
   if (i == 1) return imbalance;
-  if (i <= 4) return outvec_timer[i-3];
   return -1;
 }
 

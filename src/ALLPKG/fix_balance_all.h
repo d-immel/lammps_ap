@@ -62,12 +62,9 @@ class FixBalanceAll : public Fix {
 
   double work;                  // load of this rank
   double imbalance;             // max work / avg work
-  double timer_lb;              // duration of load balancing step in seconds
   MPI_Comm x_masters;           // for tensor to gather xsplit
   MPI_Comm y_masters;           // for tensor to gather ysplit
   MPI_Comm z_masters;           // for tensor to gather zsplit
-  bool reduce_outvec_flag;      // recaluclate out vector?
-  double outvec_timer[3]; // TODO: remove
 
   // ALL objects
 
