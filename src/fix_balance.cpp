@@ -53,6 +53,8 @@ FixBalance::FixBalance(LAMMPS *lmp, int narg, char **arg) :
   extvector = 0;
   global_freq = 1;
 
+  lb_time_accumulated = 0; // time measurements
+
   // parse required arguments
 
   int dimension = domain->dimension;
@@ -162,6 +164,7 @@ int FixBalance::setmask()
   int mask = 0;
   mask |= PRE_EXCHANGE;
   mask |= PRE_NEIGHBOR;
+  mask |= POST_RUN;
   return mask;
 }
 
@@ -238,6 +241,8 @@ void FixBalance::pre_exchange()
   if (update->ntimestep == lastbalance) return;
   lastbalance = update->ntimestep;
 
+  double t0 = platform::walltime(); // time measurements
+
   // ensure atoms are in current box & update box via shrink-wrap
   // no exchange() since doesn't matter if atoms are assigned to correct procs
 
@@ -259,6 +264,8 @@ void FixBalance::pre_exchange()
   // next timestep to rebalance
 
   if (nevery) next_reneighbor = (update->ntimestep/nevery)*nevery + nevery;
+
+  lb_time_accumulated += platform::walltime() - t0; // time measurements
 }
 
 /* ----------------------------------------------------------------------
@@ -375,4 +382,19 @@ double FixBalance::memory_usage()
   double bytes = irregular->memory_usage();
   if (balance->rcb) bytes += balance->rcb->memory_usage();
   return bytes;
+}
+
+void FixBalance::post_run()
+{
+  // print statistics about LB duration
+  double min, avg, max;
+  MPI_Reduce(&lb_time_accumulated, &min, 1, MPI_DOUBLE, MPI_MIN, 0, world);
+  MPI_Reduce(&lb_time_accumulated, &avg, 1, MPI_DOUBLE, MPI_SUM, 0, world);
+  MPI_Reduce(&lb_time_accumulated, &max, 1, MPI_DOUBLE, MPI_MAX, 0, world);
+  if (comm->me == 0) {
+    avg  /= comm->nprocs;
+    auto message = fmt::format("Total load-balancing time min {:f} avg {:f} max {:f}\n", min, avg, max);
+    utils::logmesg(lmp, message);
+  }
+  lb_time_accumulated = 0;
 }

@@ -38,6 +38,7 @@ class FixBalance : public Fix {
   double compute_scalar() override;
   double compute_vector(int) override;
   double memory_usage() override;
+  void post_run() override; // time measurements
 
  private:
   int nevery, lbstyle, nitermax;
@@ -59,6 +60,8 @@ class FixBalance : public Fix {
   class Irregular *irregular;
 
   void rebalance();
+
+  double lb_time_accumulated; // time measurements
 };
 
 }    // namespace LAMMPS_NS

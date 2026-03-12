@@ -106,6 +106,8 @@ FixBalanceAll::FixBalanceAll(LAMMPS *lmp, int narg, char **arg) :
   imbalances = nullptr;
   fixstore = nullptr;
 
+  lb_time_accumulated = 0; // time measurements
+
   box_change = BOX_CHANGE_DOMAIN;
   pre_exchange_migrate = 1;
 
@@ -293,6 +295,7 @@ int FixBalanceAll::setmask()
 {
   int mask = 0;
   mask |= PRE_EXCHANGE;
+  mask |= POST_RUN;
   return mask;
 }
 
@@ -396,10 +399,14 @@ void FixBalanceAll::pre_exchange()
 
   if (update->ntimestep < next_reneighbor) return;
 
+  double t0 = platform::walltime(); // time measurements
+
   // next timestep to rebalance
   next_reneighbor = (update->ntimestep/nevery)*nevery + nevery;
 
   balance();
+
+  lb_time_accumulated += platform::walltime() - t0; // time measurements
 }
 
 /**
@@ -834,3 +841,18 @@ double FixBalanceAll::memory_usage()
   return bytes;
 }
 
+
+void FixBalanceAll::post_run()
+{
+  // print statistics about LB duration
+  double min, avg, max;
+  MPI_Reduce(&lb_time_accumulated, &min, 1, MPI_DOUBLE, MPI_MIN, 0, world);
+  MPI_Reduce(&lb_time_accumulated, &avg, 1, MPI_DOUBLE, MPI_SUM, 0, world);
+  MPI_Reduce(&lb_time_accumulated, &max, 1, MPI_DOUBLE, MPI_MAX, 0, world);
+  if (comm->me == 0) {
+    avg  /= comm->nprocs;
+    auto message = fmt::format("Total load-balancing time min {:f} avg {:f} max {:f}\n", min, avg, max);
+    utils::logmesg(lmp, message);
+  }
+  lb_time_accumulated = 0;
+}

@@ -37,6 +37,7 @@ class FixBalanceAll : public Fix {
   void pre_exchange() override;
   double compute_vector(int) override;
   double memory_usage() override;
+  void post_run() override; // time measurements
 
  private:
 
@@ -107,6 +108,8 @@ class FixBalanceAll : public Fix {
   void unset_weights();
 
   void weight_storage();
+
+  double lb_time_accumulated; // time measurements
 
 };
 
