@@ -102,6 +102,9 @@ class FixLambdaLACSPAPIP : public Fix {
   double **f_lambda;    ///< force due to nabla lambda on atoms
   int size_f_lambda;    ///< size of f_lambda
 
+  double **peratom_stats;     ///< stored peratom stats for output
+  int size_peratom_stats;    ///< size of peratom_stats
+
   int maxneigh;      ///< size of distsq, nearest
   double *distsq;    ///< squared distance to nearest neighbors
   int *nearest;      ///< index of nearest neighbors
@@ -121,6 +124,8 @@ class FixLambdaLACSPAPIP : public Fix {
 
   enum { FORWARD_INP_LAMBDA, FORWARD_PREFACTOR };
   int comm_forward_flag;    // flag that determines which variables are communicated in comm forward
+  enum { REVERSE_AVERAGE, REVERSE_FORCE };
+  int comm_reverse_flag;    // flag that determines which variables are communicated in comm forward
 
   double *prefactor1;     // per atom array for the force calculation
   int prefactor1_size;    // own + ghosts

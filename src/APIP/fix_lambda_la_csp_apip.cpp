@@ -43,17 +43,20 @@ using namespace MathConst;
 FixLambdaLACSPAPIP::FixLambdaLACSPAPIP(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), ngh_pairs(nullptr), list(nullptr), distsq(nullptr), nearest(nullptr),
     fixstore_la_avg(nullptr), fixstore_la_inp(nullptr), fixstore_la_norm(nullptr),
-    fixstore_pairs(nullptr), f_lambda(nullptr), prefactor1(nullptr), prefactor2(nullptr)
+    fixstore_pairs(nullptr), f_lambda(nullptr), peratom_stats(nullptr),
+    prefactor1(nullptr), prefactor2(nullptr)
 {
   comm_reverse = 2;
   comm_forward = 2;
   comm_forward_flag = FORWARD_INP_LAMBDA;
+  comm_reverse_flag = REVERSE_AVERAGE;
   restart_global = 1;
 
   prefactor1_size = prefactor2_size = ngh_pairs_size = 0;
   maxneigh = 0;
 
   store_stats = false;
+  size_peratom_stats = size_f_lambda = 0;
 
   // set defaults
   cut_lo = cut_hi = -1;
@@ -156,12 +159,15 @@ FixLambdaLACSPAPIP::FixLambdaLACSPAPIP(LAMMPS *lmp, int narg, char **arg) :
     store_stats = true;
     peratom_flag = 1;
     size_peratom_cols = 5;
+    comm_reverse = 3;
 
-    size_f_lambda = atom->nlocal;
-    memory->create(f_lambda, size_f_lambda, size_peratom_cols, "pair:lambda:la:csp:apip:f:lambda");
-    array_atom = f_lambda;
+    size_f_lambda = atom->nmax;
+    size_peratom_stats = atom->nlocal;
+    memory->create(f_lambda, size_f_lambda, 3, "pair:lambda:la:csp:apip:f:lambda");
+    memory->create(peratom_stats, size_peratom_stats, size_peratom_cols, "pair:lambda:la:csp:apip:peratom:stats");
+    array_atom = peratom_stats;
     for (int i = 0; i < atom->nlocal; i++) {
-      for (int j = 0; j < size_peratom_cols; j++) f_lambda[i][j] = 0;
+      for (int j = 0; j < size_peratom_cols; j++) peratom_stats[i][j] = 0;
     }
   }
 }
@@ -172,6 +178,7 @@ FixLambdaLACSPAPIP::~FixLambdaLACSPAPIP()
 {
   memory->destroy(ngh_pairs);
   if (store_stats) memory->destroy(f_lambda);
+  if (store_stats) memory->destroy(peratom_stats);
   memory->destroy(distsq);
   memory->destroy(nearest);
   memory->destroy(prefactor1);
@@ -528,6 +535,7 @@ void FixLambdaLACSPAPIP::pre_force_dyn_pairs()
   fixstore_pairs->disable = 0;
 
   // reverse communication of csp_norm and csp_avgs of ghost atoms
+  comm_reverse_flag = REVERSE_AVERAGE;
   comm->reverse_comm(this);
 
   for (i = 0; i < nlocal; i++) {
@@ -703,6 +711,7 @@ void FixLambdaLACSPAPIP::pre_force_const_pairs()
   }
 
   // reverse communication of csp_norm and csp_avgs of ghost atoms
+  comm_reverse_flag = REVERSE_AVERAGE;
   comm->reverse_comm(this);
 
   for (i = 0; i < nlocal; i++) {
@@ -1022,15 +1031,25 @@ void *FixLambdaLACSPAPIP::extract(const char *str, int &dim)
 int FixLambdaLACSPAPIP::pack_reverse_comm(int n, int first, double *buf)
 {
   int i, m, last;
-  double *avg = fixstore_la_avg->vstore;
-  double *norm = fixstore_la_norm->vstore;
-
   m = 0;
   last = first + n;
-  for (i = first; i < last; i++) {
-    buf[m++] = avg[i];
-    buf[m++] = norm[i];
+
+  if (comm_reverse_flag == REVERSE_AVERAGE) {
+    double *avg = fixstore_la_avg->vstore;
+    double *norm = fixstore_la_norm->vstore;
+    for (i = first; i < last; i++) {
+      buf[m++] = avg[i];
+      buf[m++] = norm[i];
+    }
+
+  } else if (comm_reverse_flag == REVERSE_FORCE) {
+    for (i = first; i < last; i++) {
+      buf[m++] = f_lambda[i][0];
+      buf[m++] = f_lambda[i][1];
+      buf[m++] = f_lambda[i][2];
+    }
   }
+
   return m;
 }
 
@@ -1039,14 +1058,24 @@ int FixLambdaLACSPAPIP::pack_reverse_comm(int n, int first, double *buf)
 void FixLambdaLACSPAPIP::unpack_reverse_comm(int n, int *list, double *buf)
 {
   int i, j, m;
-  double *avg = fixstore_la_avg->vstore;
-  double *norm = fixstore_la_norm->vstore;
-
   m = 0;
-  for (i = 0; i < n; i++) {
-    j = list[i];
-    avg[j] += buf[m++];
-    norm[j] += buf[m++];
+
+  if (comm_reverse_flag == REVERSE_AVERAGE) {
+    double *avg = fixstore_la_avg->vstore;
+    double *norm = fixstore_la_norm->vstore;
+    for (i = 0; i < n; i++) {
+      j = list[i];
+      avg[j] += buf[m++];
+      norm[j] += buf[m++];
+    }
+
+  } else if (comm_reverse_flag == REVERSE_FORCE) {
+    for (i = 0; i < n; i++) {
+      j = list[i];
+      f_lambda[j][0] += buf[m++];
+      f_lambda[j][1] += buf[m++];
+      f_lambda[j][2] += buf[m++];
+    }
   }
 }
 
@@ -1116,10 +1145,10 @@ void FixLambdaLACSPAPIP::store_f_lambda_before()
 {
   if ((!store_stats) || update->ntimestep % peratom_freq) { return; }
 
-  int nlocal = atom->nlocal;
+  int nmax = atom->nmax;
   double **f = atom->f;
 
-  for (int i = 0; i < nlocal; i++) {
+  for (int i = 0; i < nmax; i++) {
     f_lambda[i][0] = -f[i][0];
     f_lambda[i][1] = -f[i][1];
     f_lambda[i][2] = -f[i][2];
@@ -1136,12 +1165,22 @@ void FixLambdaLACSPAPIP::store_f_lambda_after()
   if ((!store_stats) || update->ntimestep % peratom_freq) { return; }
 
   int nlocal = atom->nlocal;
+  int nmax = atom->nmax;
   double **f = atom->f;
 
-  for (int i = 0; i < nlocal; i++) {
+  for (int i = 0; i < nmax; i++) {
     f_lambda[i][0] += f[i][0];
     f_lambda[i][1] += f[i][1];
     f_lambda[i][2] += f[i][2];
+  }
+
+  comm_reverse_flag = REVERSE_FORCE;
+  comm->reverse_comm(this);
+
+  for (int i = 0; i < nlocal; i++) {
+    peratom_stats[i][0] = f_lambda[i][0];
+    peratom_stats[i][1] = f_lambda[i][1];
+    peratom_stats[i][2] = f_lambda[i][2];
   }
 }
 
@@ -1154,24 +1193,31 @@ void FixLambdaLACSPAPIP::store_la()
   if ((!store_stats) || update->ntimestep % peratom_freq) { return; }
 
   int nlocal = atom->nlocal;
+  int nmax = atom->nmax;
   double *inp = fixstore_la_inp->vstore;
   double *avg = fixstore_la_avg->vstore;
 
   // allocate more memory if required
-  if (nlocal > size_f_lambda) {
-    memory->destroy(f_lambda);
-    size_f_lambda = nlocal;
-    memory->create(f_lambda, size_f_lambda, size_peratom_cols, "pair:lambda:la:csp:apip:f:lambda");
-    array_atom = f_lambda;
+  if (nlocal > size_peratom_stats) {
+    memory->destroy(peratom_stats);
+    size_peratom_stats = nlocal;
+    memory->create(peratom_stats, size_peratom_stats, size_peratom_cols, "pair:lambda:la:csp:apip:peratom:stats");
+    array_atom = peratom_stats;
     // zero forces if required
     if (!calculate_forces_flag)
-      for (int i = 0; i < nlocal; i++) f_lambda[i][0] = f_lambda[i][1] = f_lambda[i][2] = 0;
+      for (int i = 0; i < nlocal; i++) peratom_stats[i][0] = peratom_stats[i][1] = peratom_stats[i][2] = 0;
+  }
+
+  if (nmax > size_f_lambda) {
+    memory->destroy(f_lambda);
+    size_f_lambda = nmax;
+    memory->create(f_lambda, size_f_lambda, 3, "pair:lambda:la:csp:apip:f:lambda");
   }
 
   for (int i = 0; i < nlocal; i++) {
     // store local averaging stats
-    f_lambda[i][3] = inp[i];
-    f_lambda[i][4] = avg[i];
+    peratom_stats[i][3] = inp[i];
+    peratom_stats[i][4] = avg[i];
   }
 }
 
