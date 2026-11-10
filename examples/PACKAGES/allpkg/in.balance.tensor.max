@@ -36,13 +36,13 @@ fix             3 all wall/lj93 ylo 0.0 1 1 2.5 yhi $y 1 1 2.5
 
 
 comm_style      brick
-fix             5 all balance/all every 50 grid tensor max local 0.9
+fix             5 all balance/all every 50 grid tensor max local 0.9 10
 
 #compute         1 all property/atom proc
 #variable        p atom c_1%10
 #dump            2 all custom 50 dump.balance.tensor.max id v_p x y z
 
-thermo_style    custom step temp epair press f_5[*]
+thermo_style    custom step temp epair press f_5[*] f_5
 thermo          100
 
 run             10000

@@ -89,9 +89,11 @@ enum { TENSOR_MAX, TENSOR_CLASSIC, NONE };
  *          trigger_threshold = float
  *              float = apply load balancer if the imbalance of the load is above this threshold
  *          bin_width = approximate width of bin (arbitrary positive value)
- *      local args = trigger_threshold (use local balancing)
+ *      local args = trigger_threshold max_repetitions (use local balancing)
  *          trigger_threshold = float
  *              float = apply load balancer if the imbalance of the load is above this threshold
+ *          max_repetitions = int
+ *              int = iterate load balancer max this many times per call
  *
  *  optional keyword arg pairs
  *
@@ -99,7 +101,7 @@ enum { TENSOR_MAX, TENSOR_CLASSIC, NONE };
  */
 
 FixBalanceAll::FixBalanceAll(LAMMPS *lmp, int narg, char **arg) :
-  Fix(lmp, narg, arg), all_local(nullptr), irregular(nullptr), all_global(nullptr)
+  Fix(lmp, narg, arg), all_local(nullptr), irregular(nullptr), all_global(nullptr), fp(nullptr)
 {
   if (narg < 6) error->all(FLERR,"Illegal fix balance/all command");
 
@@ -111,8 +113,10 @@ FixBalanceAll::FixBalanceAll(LAMMPS *lmp, int narg, char **arg) :
   box_change = BOX_CHANGE_DOMAIN;
   pre_exchange_migrate = 1;
 
+  scalar_flag = 1;
+  extscalar = 0;
   vector_flag = 1;
-  size_vector = 2;
+  size_vector = 3;
   extvector = 0;
 
   // parse required arguments
@@ -126,6 +130,7 @@ FixBalanceAll::FixBalanceAll(LAMMPS *lmp, int narg, char **arg) :
   nevery = -1;
   bw = -1;
   local_threshold = -1;
+  local_n_iter = 1;
   global_threshold = -1;
   use_local_lb = false;
   use_global_lb = false;
@@ -192,16 +197,27 @@ FixBalanceAll::FixBalanceAll(LAMMPS *lmp, int narg, char **arg) :
     } else if (strcmp(arg[iarg],"verbose") == 0) {
       verbose = true;
     } else if (strcmp(arg[iarg],"global") == 0) {
-      if (iarg+2 >= narg) error->all(FLERR, "balance/all: histogram requires two arguments");
+      if (iarg+2 >= narg) error->all(FLERR, "balance/all: global requires two arguments");
       use_global_lb = true;
       global_threshold = utils::numeric(FLERR,arg[iarg+1],false,lmp);
       bw = utils::numeric(FLERR,arg[iarg+2],false,lmp);
       iarg += 2;
     } else if (strcmp(arg[iarg],"local") == 0) {
-      if (iarg+1 >= narg) error->all(FLERR, "balance/all: threshold requires one argument");
+      if (iarg+2 >= narg) error->all(FLERR, "balance/all: local requires two arguments");
       use_local_lb = true;
       local_threshold = utils::numeric(FLERR,arg[iarg+1],false,lmp);
-      iarg++;
+      local_n_iter = utils::numeric(FLERR,arg[iarg+2],false,lmp);
+      iarg += 2;
+    } else if ((strcmp(arg[iarg],"file") == 0) || (strcmp(arg[iarg],"append") == 0)) {
+      if (iarg+1 >= narg) error->all(FLERR, "balance/all: file and append require one argument");
+      if (comm->me == 0) {
+        if (strcmp(arg[iarg],"file") == 0) fp = fopen(arg[iarg+1],"w");
+        else fp = fopen(arg[iarg+1],"a");
+        if (fp == nullptr)
+          error->one(FLERR, iarg+1, "Cannot open fix balance/all file {}: {}", arg[iarg+1],
+                     utils::getsyserror());
+      }
+      iarg += 1;
     } else error->all(FLERR,"balance/all: unknown argument '{}'", arg[iarg]);
   }
 
@@ -212,10 +228,13 @@ FixBalanceAll::FixBalanceAll(LAMMPS *lmp, int narg, char **arg) :
     if (gridstyle != STAGGERED) error->all(FLERR, "balance/all: histogram requires staggered grid");
     if (bw <= 0) error->all(FLERR, "balance/all: bw not positive");
   }
+  if (use_local_lb && local_n_iter < 1) error->all(FLERR, "balance/all: at least one iteration for local LB required");
   if (! (use_local_lb || use_global_lb)) error->all(FLERR, "balance/all: at least local, global required");
   if (use_local_lb && use_global_lb) {
     if (local_threshold >= global_threshold) error->all(FLERR, "balance/all: local threshold < global threshold required");
   }
+  if (varflag && nevery == 0)
+    error->all(FLERR, 3, "Fix balance/all nevery = 0 cannot be used with weight var");
 
   // set comm style dependent on gridstyle ? see Input::comm_style()
   // probably not since there is no running simulation in input (in contrast to here)
@@ -236,6 +255,13 @@ FixBalanceAll::FixBalanceAll(LAMMPS *lmp, int narg, char **arg) :
     n_bins = std::vector<int>(3, -1);
   }
 
+  // write file comment line if required
+  if (fp && comm->me == 0) {
+    clearerr(fp);
+    fprintf(fp, "timestep,iteration,imbalance,maxloadperproc\n");
+    if (ferror(fp)) error->one(FLERR, "Error writing LB log file header");
+  }
+
   all_last = nullptr;
 
   global_freq = 1; // nevery;
@@ -246,7 +272,8 @@ FixBalanceAll::FixBalanceAll(LAMMPS *lmp, int narg, char **arg) :
   y_masters = MPI_COMM_NULL;
   z_masters = MPI_COMM_NULL;
 
-  imbalance = maxloadperproc = -1;
+  imbfinal = imbprev = imbalance = maxloadperproc = -1;
+  pending = 0;
 
   force_reneighbor = 1;
   lastbalance = -1;
@@ -275,6 +302,7 @@ FixBalanceAll::~FixBalanceAll()
   if (fixstore && modify->nfix) modify->delete_fix(fixstore->id);
   fixstore = nullptr;
 
+  if (fp && comm->me == 0) fclose(fp);
 }
 
 /**
@@ -295,6 +323,7 @@ int FixBalanceAll::setmask()
 {
   int mask = 0;
   mask |= PRE_EXCHANGE;
+  mask |= PRE_NEIGHBOR;
   mask |= POST_RUN;
   return mask;
 }
@@ -389,6 +418,61 @@ void FixBalanceAll::init()
 }
 
 /**
+ * compute final imbalance factor if setup_pre_exchange() invoked balancer
+ * this is called at end of run setup, before output
+ */
+
+void FixBalanceAll::setup(int /*vflag*/)
+{
+  pre_neighbor();
+}
+
+/**
+ *  Perform dynamic load balancing if required.
+ *  Calls corresponding local or global balancing function.
+ */
+
+void FixBalanceAll::setup_pre_exchange()
+{
+  // do not allow rebalancing twice on same timestep
+  // even if you wanted to, it can mess up elapsed time
+
+  if (update->ntimestep == lastbalance) return;
+  lastbalance = update->ntimestep;
+
+  // next timestep to rebalance
+  if (nevery) next_reneighbor = (update->ntimestep/nevery)*nevery + nevery;
+
+  // ensure atoms are in current box & update box via shrink-wrap
+  // no exchange() since doesn't matter if atoms are assigned to correct procs
+  domain->pbc();
+  domain->reset_box();
+  // just setup comm as balance_global uses migrate_atoms that would not work otherwise
+  comm->setup();
+
+  set_weights();
+  calc_work();
+  calc_imbalance();
+  imbprev = imbalance;
+
+  // write logfile if required
+  if (fp && comm->me == 0) {
+    utils::print(fp,"{},{},{},{}\n",update->ntimestep,0,imbalance,maxloadperproc);
+  }
+
+  // call load-balancing function if required
+  if (use_global_lb && imbalance > global_threshold)
+    balance_global();
+  else if (use_local_lb && imbalance > local_threshold)
+    balance_local();
+  else {
+    itercount = 0;
+    if (verbose && comm->me == 0) utils::logmesg(lmp, "balance/all: {} no balance required\n", imbalance);
+    all_last = nullptr;
+  }
+}
+
+/**
  *  Perform dynamic load balancing if required.
  *  Calls corresponding local or global balancing function.
  */
@@ -397,36 +481,36 @@ void FixBalanceAll::pre_exchange()
 {
   // return if not a rebalance timestep
 
-  if (update->ntimestep < next_reneighbor) return;
+  if (nevery && update->ntimestep < next_reneighbor) return;
 
-  double t0 = platform::walltime(); // time measurements
-
-  // next timestep to rebalance
-  next_reneighbor = (update->ntimestep/nevery)*nevery + nevery;
-
-  balance();
-
-  lb_time_accumulated += platform::walltime() - t0; // time measurements
-}
-
-/**
- *  Perform load balancing.
- *  Calls corresponding local or global balancing function.
- */
-
-void FixBalanceAll::balance()
-{
   // do not allow rebalancing twice on same timestep
   // even if you wanted to, it can mess up elapsed time
 
   if (update->ntimestep == lastbalance) return;
   lastbalance = update->ntimestep;
 
+  // next timestep to rebalance
+  if (nevery) next_reneighbor = (update->ntimestep/nevery)*nevery + nevery;
+
+  double t0 = platform::walltime(); // time measurements
+
+  // ensure atoms are in current box & update box via shrink-wrap
+  // no exchange() since doesn't matter if atoms are assigned to correct procs
+  domain->pbc();
+  domain->reset_box();
+
+  // set weight variable for work/imbalance calculation
+  // if weight variable is used, wrap weight setting in clear/add compute
+  if (varflag) modify->clearstep_compute();
   set_weights();
+  if (varflag) modify->addstep_compute(update->ntimestep + nevery);
 
-  work = get_work();
-
+  calc_work();
   calc_imbalance();
+  imbprev = imbalance;
+  if (fp && comm->me == 0) {
+    utils::print(fp,"{},{},{},{}\n",update->ntimestep,0,imbalance,maxloadperproc);
+  }
 
   // call load-balancing function if required
   if (use_global_lb && imbalance > global_threshold)
@@ -434,11 +518,35 @@ void FixBalanceAll::balance()
   else if (use_local_lb && imbalance > local_threshold)
     balance_local();
   else {
+    itercount = 0;
     if (verbose && comm->me == 0) utils::logmesg(lmp, "balance/all: {} no balance required\n", imbalance);
     all_last = nullptr;
   }
+
+  lb_time_accumulated += platform::walltime() - t0; // time measurements
+}
+
+/**
+ * compute final imbalance factor  after comm->exchange()
+ * only do this if rebalancing just occurred
+ */
+
+void FixBalanceAll::pre_neighbor()
+{
+  if (!pending) return;
+  calc_work();
+  calc_imbalance();
+  imbfinal = imbalance;
+  // write final imbalance to log if required
+  if (fp && comm->me == 0) {
+    utils::print(fp,"{},{},{},{}\n",update->ntimestep,itercount,imbalance,maxloadperproc);
+  }
+  pending = 0;
+
+  // weights do not need to migrate with atoms any more
   unset_weights();
 }
+
 
 /**
  *  Perform staggered/tensor load balancing.
@@ -450,35 +558,64 @@ void FixBalanceAll::balance_local()
 
   all_last = all_local;
 
-  // ensure atoms are in current box & update box via shrink-wrap
-  // no exchange() since doesn't matter if atoms are assigned to correct procs
+  for (itercount=1; itercount<=local_n_iter; itercount++) {
 
-  domain->pbc();
-  domain->reset_box();
+    // The domain size is changed by adjusting the domain specific variables in comm.h
+    // local box is set with
+    // comm->{xsplit ysplit zsplit myloc procgrid} for tensor
+    // comm->mysplit                               for staggered
 
-  // The domain size is changed by adjusting the domain specific variables in comm.h
-  // local box is set with
-  // comm->{xsplit ysplit zsplit myloc procgrid} for tensor
-  // comm->mysplit                               for staggered
+    // rebalance with ALL
+    my_vertices = get_comm_vertices();
+    all_local->setVertices(my_vertices);
+    all_local->setWork(work);
+    all_local->balance();
 
-  // rebalance with ALL
-  my_vertices = get_comm_vertices();
-  all_local->setVertices(my_vertices);
-  all_local->setWork(work);
-  all_local->balance();
+    set_comm_vertices(all_local->getVertices());
+    domain->set_local_box();
 
-  set_comm_vertices(all_local->getVertices());
-  domain->set_local_box();
+    // not required since the minimum box size is also passed to all
+    // domain->subbox_too_small_check(neighbor->skin);
 
-  // not required since the minimum box size is also passed to all
-  // domain->subbox_too_small_check(neighbor->skin);
+    if (itercount<local_n_iter) {
+      // move atoms to correct proc for next iteration
+      irregular->migrate_atoms();
+      // recalculate work for next iteration
+      calc_work();
+      // store imbalance for comparison
+      double imbalance_previous = imbalance;
+      // calculate new imbalance
+      calc_imbalance();
+      if (imbalance >= imbalance_previous) {
+        // probably converged
+        break;
+      }
+      // log imbalance
+      // (after break as the final imbalance is written an pre_neighbor)
+      if (fp && comm->me == 0) {
+        utils::print(fp,"{},{},{},{}\n",update->ntimestep,itercount,imbalance,maxloadperproc);
+      }
+    } else {
+      // check wether the normal migration is sufficient
+      if (gridstyle == STAGGERED) irregular->migrate_atoms();
+      else if (irregular->migrate_check()) irregular->migrate_atoms();
+    }
 
-  if (gridstyle == STAGGERED) irregular->migrate_atoms();
-  else if (irregular->migrate_check()) irregular->migrate_atoms();
+  }
 
   modify->reset_grid();
   if (force->pair) force->pair->reset_grid();
   if (force->kspace) force->kspace->reset_grid();
+
+
+  if (fp && comm->me == 0) {
+    if (ferror(fp)) error->one(FLERR, "Error writing data per iteration within LB");
+    fflush(fp);
+  }
+
+  // pending triggers pre_neighbor() to compute final imbalance factor
+  // can only be done after atoms migrate in comm->exchange()
+  pending = 1;
 }
 
 /**
@@ -493,12 +630,6 @@ void FixBalanceAll::balance_global()
 
   // only for staggered
   // histogram method
-
-  // insure atoms are in current box & update box via shrink-wrap
-  // no exchange() since doesn't matter if atoms are assigned to correct procs
-
-  domain->pbc();
-  domain->reset_box();
 
   // atoms should be inside of the boundaries for the histogram calculation
   irregular->migrate_atoms();
@@ -524,6 +655,11 @@ void FixBalanceAll::balance_global()
   if (force->pair) force->pair->reset_grid();
   if (force->kspace) force->kspace->reset_grid();
 
+  itercount = 1;
+
+  // pending triggers pre_neighbor() to compute final imbalance factor
+  // can only be done after atoms migrate in comm->exchange()
+  pending = 1;
 }
 
 /**
@@ -580,9 +716,9 @@ std::vector<ALL::Point<double>> FixBalanceAll::get_comm_vertices()
  *  @return work according to used definition
  */
 
-double FixBalanceAll::get_work()
+void FixBalanceAll::calc_work()
 {
-  double work = 0.0;
+  work = 0.0;
 
   if (wtflag) {
     weight = fixstore->vstore;
@@ -593,8 +729,6 @@ double FixBalanceAll::get_work()
   } else {
     work = atom->nlocal;
   }
-
-  return work;
 }
 
 /**
@@ -609,6 +743,7 @@ void FixBalanceAll::set_comm_vertices(std::vector<ALL::Point<double>> vertices)
   if (gridstyle == STAGGERED) {
     // set tiled values
     comm->layout = Comm::LAYOUT_STAGGERED;
+
     // comm stores the values in reduced coordinates in [0,1]
     // -> divide by box length
     comm->staggerednew = 1;
@@ -629,6 +764,7 @@ void FixBalanceAll::set_comm_vertices(std::vector<ALL::Point<double>> vertices)
 
   } else {
     // gridstyle == TENSOR
+    comm->layout = Comm::LAYOUT_NONUNIFORM;
 
     // rescale to [0:1]
     vertices[1][0] /= domain->prd[0];
@@ -818,6 +954,15 @@ std::vector<double> FixBalanceAll::calc_histogram(int dimension)
 }
 
 /**
+ * return imbalance factor after last rebalance
+ */
+
+double FixBalanceAll::compute_scalar()
+{
+  return imbfinal;
+}
+
+/**
  *  For lammps output only.
  *  @param[in] i index of output vector
  *  @return requested value
@@ -826,7 +971,8 @@ std::vector<double> FixBalanceAll::calc_histogram(int dimension)
 double FixBalanceAll::compute_vector(int i)
 {
   if (i == 0) return maxloadperproc;
-  if (i == 1) return imbalance;
+  if (i == 1) return (double) itercount;
+  if (i == 2) return imbprev;
   return -1;
 }
 

@@ -34,7 +34,11 @@ class FixBalanceAll : public Fix {
   int setmask() override;
   void post_constructor() override;
   void init() override;
+  void setup(int) override;
+  void setup_pre_exchange() override;
   void pre_exchange() override;
+  void pre_neighbor() override;
+  double compute_scalar() override;
   double compute_vector(int) override;
   double memory_usage() override;
   void post_run() override; // time measurements
@@ -53,19 +57,25 @@ class FixBalanceAll : public Fix {
   int varflag;                  // 1 if weight style var(iable) is used
   double bw;                    // bin width for histogram
   double local_threshold;       // imbalance threshold for tensor and staggered
+  int local_n_iter;             // max number of iterations per cal
   double global_threshold;      // imbalance threshold for histogram
   bool use_bw_threshold;        // bin width threshold set
   bool use_local_lb;            // all_local (staggered or tensor) required
   bool use_global_lb;           // all_global (histogram) required
   bool verbose;                 // write stats to log
+  FILE *fp;                     // logfile for stats per iteration
 
   // calculated variables
 
   double work;                  // load of this rank
   double imbalance;             // max work / avg work
+  double imbprev;               // imbalance before LB
+  double imbfinal;              // imbalance after LB
   MPI_Comm x_masters;           // for tensor to gather xsplit
   MPI_Comm y_masters;           // for tensor to gather ysplit
   MPI_Comm z_masters;           // for tensor to gather zsplit
+  int itercount;                // iteration count of last LB call
+  int pending;
 
   // ALL objects
 
@@ -95,15 +105,14 @@ class FixBalanceAll : public Fix {
   std::vector<ALL::Point<double>> get_comm_vertices();
   std::vector<double> calc_histogram(int);
   std::vector<double> get_sys_size_from_domain();
-  double get_work();
 
   void set_comm_vertices(std::vector<ALL::Point<double>>);
 
-  void balance();
   void balance_local();
   void balance_global();
   void init_imbalance(int);
   void calc_imbalance();
+  void calc_work();
   void set_weights();
   void unset_weights();
 
