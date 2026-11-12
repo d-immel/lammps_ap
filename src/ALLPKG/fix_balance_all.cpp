@@ -599,6 +599,9 @@ void FixBalanceAll::balance_local()
       // check wether the normal migration is sufficient
       if (gridstyle == STAGGERED) irregular->migrate_atoms();
       else if (irregular->migrate_check()) irregular->migrate_atoms();
+
+      // prevent increment of itercount to local_n_iter + 1
+      break;
     }
 
   }
